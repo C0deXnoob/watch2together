@@ -5,7 +5,7 @@ const {Server}=require('socket.io');
 const {google}=require('googleapis');
 const crypto=require('crypto');
 const app=express();const server=http.createServer(app);const io=new Server(server,{cors:{origin:false}});
-app.use(express.static('public'));app.disable('x-powered-by');
+app.use(express.static(require('path').join(__dirname,'public')));app.disable('x-powered-by');app.get('/health',(_req,res)=>res.json({status:'ok'}));
 const ROOT=process.env.GOOGLE_FOLDER_ID;
 const oauthConfigured=['GOOGLE_CLIENT_ID','GOOGLE_CLIENT_SECRET','GOOGLE_REFRESH_TOKEN'].every(k=>!!process.env[k]);
 let auth;
@@ -31,10 +31,12 @@ app.get('/api/video/:id',async(req,res)=>{try{const id=req.params.id;if(!allowed
 const rooms=new Map();const roomCode=()=>crypto.randomBytes(5).toString('hex').toUpperCase();
 const clampTime=t=>Number.isFinite(Number(t))?Math.max(0,Math.min(Number(t),86400)):0;
 function publicRoom(room){return {mode:room.mode,source:room.source,playing:room.playing,time:room.playing?room.time+(Date.now()-room.updated)/1000:room.time,participants:room.users.size};}
-function join(socket,code){const room=rooms.get(code);if(!room)return socket.emit('notice','Room not found');if(room.users.size>=2)return socket.emit('notice','Room full (2 people maximum)');room.users.add(socket.id);socket.join(code);socket.data.room=code;socket.emit('joined',{code,...publicRoom(room)});io.to(code).emit('room-state',publicRoom(room));}
+function join(socket,code){const room=rooms.get(code);if(!room)return socket.emit('notice','Room not found');if(room.users.size>=2)return socket.emit('notice','Room full (2 people maximum)');room.users.add(socket.id);socket.join(code);socket.data.room=code;socket.data.role=room.host===socket.id?'host':'guest';socket.emit('joined',{code,role:socket.data.role,...publicRoom(room)});io.to(code).emit('room-state',publicRoom(room));socket.to(code).emit('notice','Your friend joined the room');}
 io.on('connection',socket=>{
- socket.on('create',()=>{if(socket.data.room)return;let code;do{code=roomCode()}while(rooms.has(code));rooms.set(code,{users:new Set(),mode:'drive',source:null,playing:false,time:0,updated:Date.now()});join(socket,code);});
+ socket.on('create',()=>{if(socket.data.room)return;let code;do{code=roomCode()}while(rooms.has(code));rooms.set(code,{host:socket.id,users:new Set(),mode:'drive',source:null,playing:false,time:0,updated:Date.now()});join(socket,code);});
  socket.on('join',raw=>{if(socket.data.room)return;join(socket,String(raw||'').trim().toUpperCase());});
+ socket.on('leave-room',()=>{const code=socket.data.room;const r=rooms.get(code);if(!r)return;socket.leave(code);r.users.delete(socket.id);socket.data.room=null;socket.data.role=null;socket.emit('room-left');if(r.users.size===0){rooms.delete(code);}else{if(r.host===socket.id){r.host=[...r.users][0];io.to(r.host).emit('role','host');}io.to(code).emit('notice','A participant left the room');io.to(code).emit('room-state',publicRoom(r));}});
+ socket.on('end-room',()=>{const code=socket.data.room;const r=rooms.get(code);if(!r)return;if(r.host!==socket.id)return socket.emit('notice','Only the host can end the room');io.to(code).emit('room-ended','The host ended this room');for(const sid of r.users){const peer=io.sockets.sockets.get(sid);if(peer){peer.leave(code);peer.data.room=null;peer.data.role=null;}}rooms.delete(code);});
  socket.on('source',payload=>{const room=rooms.get(socket.data.room);if(!room||!room.users.has(socket.id))return;let mode=payload?.mode;let source=String(payload?.source||'').slice(0,2000);
  if(mode==='drive'&&!allowed.has(source))return socket.emit('notice','Select a movie from the Drive library');
  if(mode==='youtube'&&!/^[\w-]{11}$/.test(source))return socket.emit('notice','Invalid YouTube video');
@@ -42,6 +44,6 @@ io.on('connection',socket=>{
  if(!['drive','youtube','external'].includes(mode))return;Object.assign(room,{mode,source,time:0,playing:false,updated:Date.now()});io.to(socket.data.room).emit('room-state',publicRoom(room));});
  socket.on('playback',payload=>{const room=rooms.get(socket.data.room);if(!room||room.mode==='external')return;if(!['play','pause','seek'].includes(payload?.action))return;room.time=clampTime(payload.time);room.playing=payload.action==='play'?true:payload.action==='pause'?false:room.playing;room.updated=Date.now();socket.to(socket.data.room).emit('playback',{action:payload.action,time:room.time});});
  socket.on('chat',msg=>{const room=rooms.get(socket.data.room);if(!room)return;const text=String(msg||'').trim().slice(0,500);if(text)io.to(socket.data.room).emit('chat',{from:socket.id===Array.from(room.users)[0]?'User 1':'User 2',text});});
- socket.on('disconnect',()=>{const code=socket.data.room;const room=rooms.get(code);if(!room)return;room.users.delete(socket.id);if(!room.users.size)rooms.delete(code);else io.to(code).emit('room-state',publicRoom(room));});
+ socket.on('disconnect',()=>{const code=socket.data.room;const room=rooms.get(code);if(!room)return;room.users.delete(socket.id);if(!room.users.size)rooms.delete(code);else{if(room.host===socket.id){room.host=[...room.users][0];io.to(room.host).emit('role','host');}io.to(code).emit('notice','A participant disconnected');io.to(code).emit('room-state',publicRoom(room));}});
 });
-server.listen(Number(process.env.PORT)||3000,()=>console.log('CinemaSync listening on port '+(process.env.PORT||3000)));
+server.listen(Number(process.env.PORT)||3000,'0.0.0.0',()=>console.log('CinemaSync listening on port '+(process.env.PORT||3000)));
